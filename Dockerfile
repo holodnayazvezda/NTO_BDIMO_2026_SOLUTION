@@ -1,9 +1,8 @@
-FROM python:3.12
+FROM python:3.9-slim
+
 WORKDIR /app
-
-
-ADD requirements.txt .
-RUN pip install -r requirements.txt
 COPY . .
 
-ENTRYPOINT python3 main.py
+RUN pip install --no-cache-dir -r requirements.txt
+
+CMD ["python", "main.py"]
