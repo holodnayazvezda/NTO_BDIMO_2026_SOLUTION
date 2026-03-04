@@ -42,6 +42,20 @@ CHAR_VECTORIZER_PARAMS = {
     "max_features": 100_000,
     "dtype": np.float32,
 }
+TITLE_WORD_VECTORIZER_PARAMS = {
+    "analyzer": "word",
+    "ngram_range": (1, 2),
+    "sublinear_tf": True,
+    "max_features": 60_000,
+    "dtype": np.float32,
+}
+TITLE_CHAR_VECTORIZER_PARAMS = {
+    "analyzer": "char_wb",
+    "ngram_range": (3, 5),
+    "sublinear_tf": True,
+    "max_features": 60_000,
+    "dtype": np.float32,
+}
 DEPARTMENT_MODEL_PARAMS = {
     "class_weight": "balanced",
     "C": 0.4,
@@ -55,6 +69,8 @@ SHOP_CATEGORY_REPEATS = 5
 DESCRIPTION_REPEATS = 1
 UNCERTAIN_MARGIN_THRESHOLD = 0.25
 UNCERTAIN_TOP_DEPARTMENTS = 3
+TITLE_BONUS_WEIGHT = 0.2
+DEPARTMENT_SYNC_SCORE_GAP_THRESHOLD = 0.5
 
 
 def clean_text(value: object) -> str:
@@ -99,6 +115,10 @@ def build_search_texts(dataframe: pd.DataFrame) -> list[str]:
 
         texts.append(" ".join(parts))
     return texts
+
+
+def build_title_texts(dataframe: pd.DataFrame) -> list[str]:
+    return dataframe["title"].map(clean_text).tolist()
 
 
 def build_rule_keys(dataframe: pd.DataFrame, columns: tuple[str, ...]) -> np.ndarray:
@@ -156,11 +176,40 @@ def transform_feature_blocks(
     )
 
 
+def fit_title_feature_blocks(
+    texts: list[str],
+) -> tuple[TfidfVectorizer, TfidfVectorizer, sparse.csr_matrix]:
+    word_vectorizer = TfidfVectorizer(**TITLE_WORD_VECTORIZER_PARAMS)
+    char_vectorizer = TfidfVectorizer(**TITLE_CHAR_VECTORIZER_PARAMS)
+    word_features = word_vectorizer.fit_transform(texts)
+    char_features = char_vectorizer.fit_transform(texts)
+    features = sparse.hstack(
+        [word_features, char_features],
+        format="csr",
+        dtype=np.float32,
+    )
+    return word_vectorizer, char_vectorizer, features
+
+
+def transform_title_feature_blocks(
+    word_vectorizer: TfidfVectorizer,
+    char_vectorizer: TfidfVectorizer,
+    texts: list[str],
+) -> sparse.csr_matrix:
+    word_features = word_vectorizer.transform(texts)
+    char_features = char_vectorizer.transform(texts)
+    return sparse.hstack(
+        [word_features, char_features],
+        format="csr",
+        dtype=np.float32,
+    )
+
+
 def build_category_centroids(
     train_matrix: sparse.csr_matrix,
     train_categories: np.ndarray,
     category_department_map: dict[int, int],
-) -> tuple[np.ndarray, sparse.csr_matrix, dict[int, np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, sparse.csr_matrix, dict[int, np.ndarray]]:
     category_labels, inverse_indices = np.unique(
         train_categories,
         return_inverse=True,
@@ -192,6 +241,7 @@ def build_category_centroids(
     }
     return (
         category_labels.astype(np.int32, copy=False),
+        category_departments,
         category_centroid_matrix,
         department_category_indices,
     )
@@ -199,11 +249,16 @@ def build_category_centroids(
 
 def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     texts = build_search_texts(dataframe)
+    title_texts = build_title_texts(dataframe)
     word_vectorizer, char_vectorizer, train_matrix = fit_feature_blocks(texts)
+    title_word_vectorizer, title_char_vectorizer, title_matrix = fit_title_feature_blocks(
+        title_texts
+    )
 
     department_model = LinearSVC(**DEPARTMENT_MODEL_PARAMS)
     department_model.fit(train_matrix, dataframe["department_id"])
 
+    train_categories = dataframe["category_id"].to_numpy(dtype=np.int32)
     category_department_map = (
         dataframe.drop_duplicates("category_id")
         .set_index("category_id")["department_id"]
@@ -212,13 +267,26 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     )
     (
         category_labels,
+        category_departments,
         category_centroid_matrix,
         department_category_indices,
     ) = build_category_centroids(
         train_matrix,
-        dataframe["category_id"].to_numpy(dtype=np.int32),
+        train_categories,
         category_department_map,
     )
+    (
+        title_category_labels,
+        _,
+        category_title_centroid_matrix,
+        _,
+    ) = build_category_centroids(
+        title_matrix,
+        train_categories,
+        category_department_map,
+    )
+    if not np.array_equal(category_labels, title_category_labels):
+        raise ValueError("Category labels are inconsistent across feature views")
 
     override_maps = []
     for columns in OVERRIDE_RULES:
@@ -232,26 +300,42 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     return {
         "word_vectorizer": word_vectorizer,
         "char_vectorizer": char_vectorizer,
+        "title_word_vectorizer": title_word_vectorizer,
+        "title_char_vectorizer": title_char_vectorizer,
         "department_model": department_model,
         "category_labels": category_labels,
+        "category_departments": category_departments,
         "category_centroid_matrix": category_centroid_matrix,
+        "category_title_centroid_matrix": category_title_centroid_matrix,
         "department_category_indices": department_category_indices,
         "category_department_map": category_department_map,
         "override_maps": override_maps,
     }
 
 
-def nearest_centroid_categories(
+def compute_similarity_scores(
     query_matrix: sparse.csr_matrix,
     category_centroid_matrix: sparse.csr_matrix,
-    category_labels: np.ndarray,
+    query_title_matrix: sparse.csr_matrix,
+    category_title_centroid_matrix: sparse.csr_matrix,
+) -> sparse.csr_matrix:
+    scores = query_matrix @ category_centroid_matrix.T
+    title_scores = query_title_matrix @ category_title_centroid_matrix.T
+    return scores + TITLE_BONUS_WEIGHT * title_scores
+
+
+def nearest_centroid_category_indices(
+    query_matrix: sparse.csr_matrix,
+    category_centroid_matrix: sparse.csr_matrix,
+    query_title_matrix: sparse.csr_matrix,
+    category_title_centroid_matrix: sparse.csr_matrix,
     department_category_indices: dict[int, np.ndarray],
     top_departments: np.ndarray,
     uncertain_mask: np.ndarray,
     batch_size: int = BATCH_SIZE,
 ) -> np.ndarray:
     predictions = np.empty(query_matrix.shape[0], dtype=np.int32)
-    all_indices = np.arange(category_labels.shape[0], dtype=np.int32)
+    all_indices = np.arange(category_centroid_matrix.shape[0], dtype=np.int32)
 
     predicted_departments = top_departments[:, 0]
     confident_query_indices = np.flatnonzero(~uncertain_mask)
@@ -268,15 +352,19 @@ def nearest_centroid_categories(
             all_indices,
         )
         candidate_matrix = category_centroid_matrix[candidate_indices]
+        candidate_title_matrix = category_title_centroid_matrix[candidate_indices]
 
         for start in range(0, len(query_indices), batch_size):
             stop = min(start + batch_size, len(query_indices))
             batch_query_indices = query_indices[start:stop]
-            scores = query_matrix[batch_query_indices] @ candidate_matrix.T
+            scores = compute_similarity_scores(
+                query_matrix[batch_query_indices],
+                candidate_matrix,
+                query_title_matrix[batch_query_indices],
+                candidate_title_matrix,
+            )
             best_local_indices = np.asarray(scores.argmax(axis=1)).ravel()
-            predictions[batch_query_indices] = category_labels[
-                candidate_indices[best_local_indices]
-            ]
+            predictions[batch_query_indices] = candidate_indices[best_local_indices]
 
     for query_index in np.flatnonzero(uncertain_mask):
         candidate_parts = []
@@ -293,10 +381,55 @@ def nearest_centroid_categories(
         if len(candidate_indices) == 0:
             candidate_indices = all_indices
         candidate_matrix = category_centroid_matrix[candidate_indices]
-        scores = query_matrix[query_index : query_index + 1] @ candidate_matrix.T
+        candidate_title_matrix = category_title_centroid_matrix[candidate_indices]
+        scores = compute_similarity_scores(
+            query_matrix[query_index : query_index + 1],
+            candidate_matrix,
+            query_title_matrix[query_index : query_index + 1],
+            candidate_title_matrix,
+        )
         best_local_index = int(np.asarray(scores.argmax(axis=1)).ravel()[0])
-        predictions[query_index] = category_labels[candidate_indices[best_local_index]]
+        predictions[query_index] = candidate_indices[best_local_index]
     return predictions
+
+
+def should_sync_department_to_category(
+    query_features: sparse.csr_matrix,
+    query_title_features: sparse.csr_matrix,
+    selected_category_index: int,
+    top_department: int,
+    model_bundle: dict[str, object],
+) -> bool:
+    top_department_indices = model_bundle["department_category_indices"].get(
+        int(top_department),
+        np.empty(0, dtype=np.int32),
+    )
+    if len(top_department_indices) == 0:
+        return False
+
+    selected_scores = compute_similarity_scores(
+        query_features,
+        model_bundle["category_centroid_matrix"][
+            selected_category_index : selected_category_index + 1
+        ],
+        query_title_features,
+        model_bundle["category_title_centroid_matrix"][
+            selected_category_index : selected_category_index + 1
+        ],
+    )
+    top_department_scores = compute_similarity_scores(
+        query_features,
+        model_bundle["category_centroid_matrix"][top_department_indices],
+        query_title_features,
+        model_bundle["category_title_centroid_matrix"][top_department_indices],
+    )
+    selected_score = float(np.asarray(selected_scores.toarray()).ravel()[0])
+    best_top_department_score = float(
+        np.asarray(top_department_scores.max()).ravel()[0]
+    )
+    return (
+        selected_score - best_top_department_score
+    ) >= DEPARTMENT_SYNC_SCORE_GAP_THRESHOLD
 
 
 def apply_category_overrides_with_flags(
@@ -364,10 +497,16 @@ def predict_with_bundle(
     model_bundle: dict[str, object], dataframe: pd.DataFrame
 ) -> pd.DataFrame:
     texts = build_search_texts(dataframe)
+    title_texts = build_title_texts(dataframe)
     query_matrix = transform_feature_blocks(
         model_bundle["word_vectorizer"],
         model_bundle["char_vectorizer"],
         texts,
+    )
+    query_title_matrix = transform_title_feature_blocks(
+        model_bundle["title_word_vectorizer"],
+        model_bundle["title_char_vectorizer"],
+        title_texts,
     )
 
     top_departments, uncertain_mask = get_department_candidates(
@@ -375,21 +514,39 @@ def predict_with_bundle(
         query_matrix,
     )
     department_predictions = top_departments[:, 0]
-    base_categories = nearest_centroid_categories(
+    base_category_indices = nearest_centroid_category_indices(
         query_matrix,
         model_bundle["category_centroid_matrix"],
-        model_bundle["category_labels"],
+        query_title_matrix,
+        model_bundle["category_title_centroid_matrix"],
         model_bundle["department_category_indices"],
         top_departments,
         uncertain_mask,
     )
+    base_categories = model_bundle["category_labels"][base_category_indices]
     category_predictions, override_used = apply_category_overrides_with_flags(
         dataframe,
         base_categories,
         model_bundle["override_maps"],
     )
     final_departments = department_predictions.astype(np.int64, copy=True)
+    base_category_departments = model_bundle["category_departments"][
+        base_category_indices
+    ].astype(np.int64, copy=False)
     category_department_map = model_bundle["category_department_map"]
+    sync_candidate_indices = np.flatnonzero(
+        (~override_used) & (base_category_departments != final_departments)
+    )
+    for index in sync_candidate_indices:
+        if should_sync_department_to_category(
+            query_matrix[index : index + 1],
+            query_title_matrix[index : index + 1],
+            int(base_category_indices[index]),
+            int(department_predictions[index]),
+            model_bundle,
+        ):
+            final_departments[index] = base_category_departments[index]
+
     override_indices = np.flatnonzero(override_used)
     if len(override_indices) > 0:
         final_departments[override_indices] = np.array(
