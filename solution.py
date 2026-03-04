@@ -32,22 +32,29 @@ WORD_VECTORIZER_PARAMS = {
     "analyzer": "word",
     "ngram_range": (1, 2),
     "sublinear_tf": True,
-    "max_features": 60_000,
+    "max_features": 100_000,
     "dtype": np.float32,
 }
 CHAR_VECTORIZER_PARAMS = {
     "analyzer": "char_wb",
     "ngram_range": (3, 5),
     "sublinear_tf": True,
-    "max_features": 70_000,
+    "max_features": 100_000,
     "dtype": np.float32,
 }
 DEPARTMENT_MODEL_PARAMS = {
     "class_weight": "balanced",
-    "C": 1.0,
+    "C": 0.4,
     "random_state": 42,
 }
 BATCH_SIZE = 256
+VENDOR_REPEATS = 1
+CODE_REPEATS = 1
+TITLE_REPEATS = 5
+SHOP_CATEGORY_REPEATS = 5
+DESCRIPTION_REPEATS = 1
+UNCERTAIN_MARGIN_THRESHOLD = 0.25
+UNCERTAIN_TOP_DEPARTMENTS = 3
 
 
 def clean_text(value: object) -> str:
@@ -72,15 +79,24 @@ def build_search_texts(dataframe: pd.DataFrame) -> list[str]:
     texts: list[str] = []
     rows = dataframe[TEXT_COLUMNS].itertuples(index=False, name=None)
     for vendor_name, vendor_code, title, description, shop_category_name in rows:
-        parts = [
-            "vendor " + clean_text(vendor_name),
-            "code " + clean_text(vendor_code),
-            "title " + clean_text(title),
-            "title " + clean_text(title),
-            "shopcat " + clean_text(shop_category_name),
-            "shopcat " + clean_text(shop_category_name),
-            "desc " + clean_text(description),
-        ]
+        c_vendor = clean_text(vendor_name)
+        c_code = clean_text(vendor_code)
+        c_title = clean_text(title)
+        c_desc = clean_text(description)
+        c_shopcat = clean_text(shop_category_name)
+
+        parts = []
+        for _ in range(VENDOR_REPEATS):
+            parts.append("vendor " + c_vendor)
+        for _ in range(CODE_REPEATS):
+            parts.append("code " + c_code)
+        for _ in range(TITLE_REPEATS):
+            parts.append("title " + c_title)
+        for _ in range(SHOP_CATEGORY_REPEATS):
+            parts.append("shopcat " + c_shopcat)
+        for _ in range(DESCRIPTION_REPEATS):
+            parts.append("desc " + c_desc)
+
         texts.append(" ".join(parts))
     return texts
 
@@ -147,6 +163,13 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     department_model = LinearSVC(**DEPARTMENT_MODEL_PARAMS)
     department_model.fit(train_matrix, dataframe["department_id"])
 
+    category_department_map = (
+        dataframe.drop_duplicates("category_id")
+        .set_index("category_id")["department_id"]
+        .astype(np.int64)
+        .to_dict()
+    )
+
     override_maps = []
     for columns in OVERRIDE_RULES:
         override_maps.append(
@@ -162,6 +185,8 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
         "department_model": department_model,
         "train_matrix": train_matrix,
         "train_categories": dataframe["category_id"].to_numpy(dtype=np.int32),
+        "train_departments": dataframe["department_id"].to_numpy(dtype=np.int16),
+        "category_department_map": category_department_map,
         "override_maps": override_maps,
     }
 
@@ -170,25 +195,67 @@ def nearest_neighbor_categories(
     query_matrix: sparse.csr_matrix,
     train_matrix: sparse.csr_matrix,
     train_categories: np.ndarray,
+    train_departments: np.ndarray,
+    top_departments: np.ndarray,
+    uncertain_mask: np.ndarray,
     batch_size: int = BATCH_SIZE,
 ) -> np.ndarray:
     predictions = np.empty(query_matrix.shape[0], dtype=np.int64)
-    for start in range(0, query_matrix.shape[0], batch_size):
-        stop = min(start + batch_size, query_matrix.shape[0])
-        scores = query_matrix[start:stop] @ train_matrix.T
-        best_indices = np.asarray(scores.argmax(axis=1)).ravel()
-        predictions[start:stop] = train_categories[best_indices]
+    all_indices = np.arange(train_categories.shape[0], dtype=np.int32)
+    department_train_indices = {
+        int(department): np.flatnonzero(train_departments == department)
+        for department in np.unique(train_departments)
+    }
+
+    predicted_departments = top_departments[:, 0]
+    confident_query_indices = np.flatnonzero(~uncertain_mask)
+
+    for department in np.unique(predicted_departments[confident_query_indices]):
+        query_indices = confident_query_indices[
+            predicted_departments[confident_query_indices] == department
+        ]
+        if len(query_indices) == 0:
+            continue
+
+        candidate_indices = department_train_indices.get(int(department), all_indices)
+        candidate_matrix = train_matrix[candidate_indices]
+
+        for start in range(0, len(query_indices), batch_size):
+            stop = min(start + batch_size, len(query_indices))
+            batch_query_indices = query_indices[start:stop]
+            scores = query_matrix[batch_query_indices] @ candidate_matrix.T
+            best_local_indices = np.asarray(scores.argmax(axis=1)).ravel()
+            best_indices = candidate_indices[best_local_indices]
+            predictions[batch_query_indices] = train_categories[best_indices]
+
+    for query_index in np.flatnonzero(uncertain_mask):
+        candidate_parts = []
+        for department in top_departments[query_index]:
+            candidate_parts.append(
+                department_train_indices.get(
+                    int(department),
+                    np.empty(0, dtype=np.int32),
+                )
+            )
+        candidate_indices = np.concatenate(candidate_parts) if candidate_parts else all_indices
+        if len(candidate_indices) == 0:
+            candidate_indices = all_indices
+        candidate_matrix = train_matrix[candidate_indices]
+        scores = query_matrix[query_index : query_index + 1] @ candidate_matrix.T
+        best_local_index = int(np.asarray(scores.argmax(axis=1)).ravel()[0])
+        predictions[query_index] = train_categories[candidate_indices[best_local_index]]
     return predictions
 
 
-def apply_category_overrides(
+def apply_category_overrides_with_flags(
     dataframe: pd.DataFrame,
     base_categories: np.ndarray,
     override_maps: list[dict[str, object]],
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     predictions = base_categories.copy()
+    override_used = np.zeros(len(predictions), dtype=bool)
     if len(predictions) == 0:
-        return predictions
+        return predictions, override_used
 
     rule_keys = []
     for rule in override_maps:
@@ -201,8 +268,44 @@ def apply_category_overrides(
             key = rule_keys[rule_index][row_index]
             if has_meaningful_key(key) and key in mapping:
                 predictions[row_index] = mapping[key]
+                override_used[row_index] = True
                 break
+    return predictions, override_used
+
+
+def apply_category_overrides(
+    dataframe: pd.DataFrame,
+    base_categories: np.ndarray,
+    override_maps: list[dict[str, object]],
+) -> np.ndarray:
+    predictions, _ = apply_category_overrides_with_flags(
+        dataframe,
+        base_categories,
+        override_maps,
+    )
     return predictions
+
+
+def get_department_candidates(
+    department_model: LinearSVC,
+    query_matrix: sparse.csr_matrix,
+    top_k: int = UNCERTAIN_TOP_DEPARTMENTS,
+) -> tuple[np.ndarray, np.ndarray]:
+    decision_scores = department_model.decision_function(query_matrix)
+    if decision_scores.ndim == 1:
+        top_departments = department_model.predict(query_matrix).astype(np.int64).reshape(-1, 1)
+        uncertain_mask = np.zeros(query_matrix.shape[0], dtype=bool)
+        return top_departments, uncertain_mask
+
+    top_k = max(1, min(top_k, decision_scores.shape[1]))
+    sorted_indices = np.argsort(decision_scores, axis=1)
+    top_indices = sorted_indices[:, -top_k:][:, ::-1]
+    top_departments = np.asarray(department_model.classes_[top_indices], dtype=np.int64)
+
+    top_scores = decision_scores[np.arange(decision_scores.shape[0]), top_indices[:, 0]]
+    second_scores = decision_scores[np.arange(decision_scores.shape[0]), top_indices[:, 1]]
+    uncertain_mask = (top_scores - second_scores) < UNCERTAIN_MARGIN_THRESHOLD
+    return top_departments, uncertain_mask
 
 
 def predict_with_bundle(
@@ -215,21 +318,42 @@ def predict_with_bundle(
         texts,
     )
 
-    department_predictions = model_bundle["department_model"].predict(query_matrix)
+    top_departments, uncertain_mask = get_department_candidates(
+        model_bundle["department_model"],
+        query_matrix,
+    )
+    department_predictions = top_departments[:, 0]
     base_categories = nearest_neighbor_categories(
         query_matrix,
         model_bundle["train_matrix"],
         model_bundle["train_categories"],
+        model_bundle["train_departments"],
+        top_departments,
+        uncertain_mask,
     )
-    category_predictions = apply_category_overrides(
+    category_predictions, override_used = apply_category_overrides_with_flags(
         dataframe,
         base_categories,
         model_bundle["override_maps"],
     )
+    final_departments = department_predictions.astype(np.int64, copy=True)
+    category_department_map = model_bundle["category_department_map"]
+    override_indices = np.flatnonzero(override_used)
+    if len(override_indices) > 0:
+        final_departments[override_indices] = np.array(
+            [
+                category_department_map.get(
+                    int(category_predictions[index]),
+                    int(final_departments[index]),
+                )
+                for index in override_indices
+            ],
+            dtype=np.int64,
+        )
 
     return pd.DataFrame(
         {
-            "department_id": department_predictions.astype(np.int64),
+            "department_id": final_departments,
             "category_id": category_predictions.astype(np.int64),
         }
     )
@@ -307,3 +431,8 @@ def predict_to_csv(
     predictions = predict_with_bundle(model_bundle, test)
     predictions.to_csv(output_path, index=False)
     return predictions
+
+
+if __name__ == "__main__":
+    df = load_dataset("train.tsv")
+    print(evaluate_with_splits(df))
