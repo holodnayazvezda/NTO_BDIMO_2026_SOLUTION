@@ -67,12 +67,6 @@ def clean_text(value: object) -> str:
     return text.strip().lower()
 
 
-def clean_vendor_code(value: object) -> str:
-    text = clean_text(value)
-    # normalize formatting noise: keep only letters+digits (latin/cyrillic)
-    return re.sub(r"[^0-9a-zа-я]+", "", text)
-
-
 def load_dataset(path: str | Path) -> pd.DataFrame:
     dataset = pd.read_csv(path, sep="\t")
     for column in TEXT_COLUMNS:
@@ -133,18 +127,6 @@ def build_unique_category_map(
     return dict(zip(unique_rows["key"], unique_rows["category_id"]))
 
 
-def build_unique_vendor_code_norm_map(dataframe: pd.DataFrame) -> dict[str, int]:
-    temp = dataframe[["vendor_code", "category_id"]].copy()
-    temp["key"] = temp["vendor_code"].map(clean_vendor_code)
-    temp = temp[temp["key"].map(has_meaningful_key)]
-    counts = temp.groupby("key")["category_id"].nunique()
-    unique_keys = counts[counts == 1].index
-    if len(unique_keys) == 0:
-        return {}
-    unique_rows = temp[temp["key"].isin(unique_keys)].drop_duplicates("key")
-    return dict(zip(unique_rows["key"], unique_rows["category_id"]))
-
-
 def fit_feature_blocks(
     texts: list[str],
 ) -> tuple[TfidfVectorizer, TfidfVectorizer, sparse.csr_matrix]:
@@ -174,6 +156,47 @@ def transform_feature_blocks(
     )
 
 
+def build_category_centroids(
+    train_matrix: sparse.csr_matrix,
+    train_categories: np.ndarray,
+    category_department_map: dict[int, int],
+) -> tuple[np.ndarray, sparse.csr_matrix, dict[int, np.ndarray]]:
+    category_labels, inverse_indices = np.unique(
+        train_categories,
+        return_inverse=True,
+    )
+    row_indices = inverse_indices.astype(np.int32, copy=False)
+    col_indices = np.arange(train_matrix.shape[0], dtype=np.int32)
+    weights = np.ones(train_matrix.shape[0], dtype=np.float32)
+
+    assignment = sparse.csr_matrix(
+        (weights, (row_indices, col_indices)),
+        shape=(len(category_labels), train_matrix.shape[0]),
+        dtype=np.float32,
+    )
+    counts = np.asarray(assignment.sum(axis=1)).ravel()
+    normalizer = sparse.diags(
+        1.0 / np.maximum(counts, 1.0),
+        dtype=np.float32,
+    )
+    category_centroid_matrix = (normalizer @ assignment @ train_matrix).tocsr()
+    category_departments = np.array(
+        [category_department_map[int(category)] for category in category_labels],
+        dtype=np.int16,
+    )
+    department_category_indices = {
+        int(department): np.flatnonzero(category_departments == department).astype(
+            np.int32
+        )
+        for department in np.unique(category_departments)
+    }
+    return (
+        category_labels.astype(np.int32, copy=False),
+        category_centroid_matrix,
+        department_category_indices,
+    )
+
+
 def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     texts = build_search_texts(dataframe)
     word_vectorizer, char_vectorizer, train_matrix = fit_feature_blocks(texts)
@@ -187,6 +210,15 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
         .astype(np.int64)
         .to_dict()
     )
+    (
+        category_labels,
+        category_centroid_matrix,
+        department_category_indices,
+    ) = build_category_centroids(
+        train_matrix,
+        dataframe["category_id"].to_numpy(dtype=np.int32),
+        category_department_map,
+    )
 
     override_maps = []
     for columns in OVERRIDE_RULES:
@@ -196,36 +228,30 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
                 "mapping": build_unique_category_map(dataframe, columns),
             }
         )
-    vendor_code_norm_map = build_unique_vendor_code_norm_map(dataframe)
 
     return {
         "word_vectorizer": word_vectorizer,
         "char_vectorizer": char_vectorizer,
         "department_model": department_model,
-        "train_matrix": train_matrix,
-        "train_categories": dataframe["category_id"].to_numpy(dtype=np.int32),
-        "train_departments": dataframe["department_id"].to_numpy(dtype=np.int16),
+        "category_labels": category_labels,
+        "category_centroid_matrix": category_centroid_matrix,
+        "department_category_indices": department_category_indices,
         "category_department_map": category_department_map,
         "override_maps": override_maps,
-        "vendor_code_norm_map": vendor_code_norm_map,
     }
 
 
-def nearest_neighbor_categories(
+def nearest_centroid_categories(
     query_matrix: sparse.csr_matrix,
-    train_matrix: sparse.csr_matrix,
-    train_categories: np.ndarray,
-    train_departments: np.ndarray,
+    category_centroid_matrix: sparse.csr_matrix,
+    category_labels: np.ndarray,
+    department_category_indices: dict[int, np.ndarray],
     top_departments: np.ndarray,
     uncertain_mask: np.ndarray,
     batch_size: int = BATCH_SIZE,
 ) -> np.ndarray:
-    predictions = np.empty(query_matrix.shape[0], dtype=np.int64)
-    all_indices = np.arange(train_categories.shape[0], dtype=np.int32)
-    department_train_indices = {
-        int(department): np.flatnonzero(train_departments == department)
-        for department in np.unique(train_departments)
-    }
+    predictions = np.empty(query_matrix.shape[0], dtype=np.int32)
+    all_indices = np.arange(category_labels.shape[0], dtype=np.int32)
 
     predicted_departments = top_departments[:, 0]
     confident_query_indices = np.flatnonzero(~uncertain_mask)
@@ -237,33 +263,39 @@ def nearest_neighbor_categories(
         if len(query_indices) == 0:
             continue
 
-        candidate_indices = department_train_indices.get(int(department), all_indices)
-        candidate_matrix = train_matrix[candidate_indices]
+        candidate_indices = department_category_indices.get(
+            int(department),
+            all_indices,
+        )
+        candidate_matrix = category_centroid_matrix[candidate_indices]
 
         for start in range(0, len(query_indices), batch_size):
             stop = min(start + batch_size, len(query_indices))
             batch_query_indices = query_indices[start:stop]
             scores = query_matrix[batch_query_indices] @ candidate_matrix.T
             best_local_indices = np.asarray(scores.argmax(axis=1)).ravel()
-            best_indices = candidate_indices[best_local_indices]
-            predictions[batch_query_indices] = train_categories[best_indices]
+            predictions[batch_query_indices] = category_labels[
+                candidate_indices[best_local_indices]
+            ]
 
     for query_index in np.flatnonzero(uncertain_mask):
         candidate_parts = []
         for department in top_departments[query_index]:
             candidate_parts.append(
-                department_train_indices.get(
+                department_category_indices.get(
                     int(department),
                     np.empty(0, dtype=np.int32),
                 )
             )
-        candidate_indices = np.concatenate(candidate_parts) if candidate_parts else all_indices
+        candidate_indices = (
+            np.concatenate(candidate_parts) if candidate_parts else all_indices
+        )
         if len(candidate_indices) == 0:
             candidate_indices = all_indices
-        candidate_matrix = train_matrix[candidate_indices]
+        candidate_matrix = category_centroid_matrix[candidate_indices]
         scores = query_matrix[query_index : query_index + 1] @ candidate_matrix.T
         best_local_index = int(np.asarray(scores.argmax(axis=1)).ravel()[0])
-        predictions[query_index] = train_categories[candidate_indices[best_local_index]]
+        predictions[query_index] = category_labels[candidate_indices[best_local_index]]
     return predictions
 
 
@@ -271,16 +303,11 @@ def apply_category_overrides_with_flags(
     dataframe: pd.DataFrame,
     base_categories: np.ndarray,
     override_maps: list[dict[str, object]],
-    vendor_code_norm_map: dict[str, int],
 ) -> tuple[np.ndarray, np.ndarray]:
     predictions = base_categories.copy()
     override_used = np.zeros(len(predictions), dtype=bool)
     if len(predictions) == 0:
         return predictions, override_used
-
-    vendor_code_norm_keys = dataframe["vendor_code"].map(clean_vendor_code).to_numpy(
-        dtype=object
-    )
 
     rule_keys = []
     for rule in override_maps:
@@ -288,11 +315,6 @@ def apply_category_overrides_with_flags(
         rule_keys.append(build_rule_keys(dataframe, columns))
 
     for row_index in range(len(predictions)):
-        key_norm = vendor_code_norm_keys[row_index]
-        if has_meaningful_key(key_norm) and key_norm in vendor_code_norm_map:
-            predictions[row_index] = vendor_code_norm_map[key_norm]
-            override_used[row_index] = True
-            continue
         for rule_index, rule in enumerate(override_maps):
             mapping = rule["mapping"]
             key = rule_keys[rule_index][row_index]
@@ -307,13 +329,11 @@ def apply_category_overrides(
     dataframe: pd.DataFrame,
     base_categories: np.ndarray,
     override_maps: list[dict[str, object]],
-    vendor_code_norm_map: dict[str, int],
 ) -> np.ndarray:
     predictions, _ = apply_category_overrides_with_flags(
         dataframe,
         base_categories,
         override_maps,
-        vendor_code_norm_map,
     )
     return predictions
 
@@ -355,11 +375,11 @@ def predict_with_bundle(
         query_matrix,
     )
     department_predictions = top_departments[:, 0]
-    base_categories = nearest_neighbor_categories(
+    base_categories = nearest_centroid_categories(
         query_matrix,
-        model_bundle["train_matrix"],
-        model_bundle["train_categories"],
-        model_bundle["train_departments"],
+        model_bundle["category_centroid_matrix"],
+        model_bundle["category_labels"],
+        model_bundle["department_category_indices"],
         top_departments,
         uncertain_mask,
     )
@@ -367,7 +387,6 @@ def predict_with_bundle(
         dataframe,
         base_categories,
         model_bundle["override_maps"],
-        model_bundle["vendor_code_norm_map"],
     )
     final_departments = department_predictions.astype(np.int64, copy=True)
     category_department_map = model_bundle["category_department_map"]
