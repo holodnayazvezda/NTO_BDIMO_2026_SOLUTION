@@ -25,11 +25,10 @@ TEXT_COLUMNS = [
     "shop_category_name",
 ]
 OVERRIDE_RULES = [
-    ("vendor_name", "vendor_code"),
+    ("shop_category_name", "title"),
     ("vendor_name", "title"),
     ("shop_category_name", "vendor_code"),
     ("shop_category_name",),
-    ("shop_category_name", "title"),
     ("title",),
     ("vendor_code",),
 ]
