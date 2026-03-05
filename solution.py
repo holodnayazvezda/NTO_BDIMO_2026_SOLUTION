@@ -1031,36 +1031,89 @@ def score_predictions(
         "category_accuracy": category_accuracy,
     }
 
-
 def evaluate_with_splits(
-    dataframe: pd.DataFrame,
-    n_splits: int = 3,
-    test_size: float = 0.2,
-    random_state: int = 42,
+        dataframe: pd.DataFrame,
+        n_splits: int = 3,
+        test_size: float = 0.2,
+        random_state: int = 42,
 ) -> dict[str, float]:
-    splitter = ShuffleSplit(
-        n_splits=n_splits,
-        test_size=test_size,
-        random_state=random_state,
-    )
+
+    cat_to_indices: dict[int, list[int]] = {}
+    for idx, cat in zip(dataframe.index, dataframe["category_id"]):
+        cat_to_indices.setdefault(int(cat), []).append(idx)
+
+    triple_cats = [c for c, idxs in cat_to_indices.items() if len(idxs) == 3]
+    double_cats = [c for c, idxs in cat_to_indices.items() if len(idxs) == 2]
+    single_cats = [c for c, idxs in cat_to_indices.items() if len(idxs) == 1]
+
+    target_val = int(test_size * len(dataframe))
+    n_from_triples = len(triple_cats)
+    n_from_doubles = max(0, min(target_val - n_from_triples, len(double_cats)))
+
     scores = []
-    for train_indices, valid_indices in splitter.split(dataframe):
-        train_fold = dataframe.iloc[train_indices].reset_index(drop=True)
-        valid_fold = dataframe.iloc[valid_indices].reset_index(drop=True)
+
+    for fold_idx in range(n_splits):
+        rng = np.random.RandomState(random_state + fold_idx)
+
+        val_indices: list[int] = []
+        train_indices: list[int] = []
+
+        # 1) Все triple-категории: 1 рандомная запись в val, 2 в train
+        for cat_id in triple_cats:
+            indices = list(cat_to_indices[cat_id])
+            rng.shuffle(indices)
+            val_indices.append(indices[0])
+            train_indices.extend(indices[1:])
+
+        # 2) Рандомная выборка из double-категорий
+        selected_doubles = set(
+            rng.choice(double_cats, size=n_from_doubles, replace=False)
+        )
+        for cat_id in double_cats:
+            indices = list(cat_to_indices[cat_id])
+            if cat_id in selected_doubles:
+                rng.shuffle(indices)
+                val_indices.append(indices[0])
+                train_indices.extend(indices[1:])
+            else:
+                train_indices.extend(indices)
+
+        # 3) Single-категории: только train
+        for cat_id in single_cats:
+            train_indices.extend(cat_to_indices[cat_id])
+
+        train_fold = dataframe.loc[train_indices].reset_index(drop=True)
+        val_fold = dataframe.loc[val_indices].reset_index(drop=True)
+
+        # Проверка: orphan categories
+        val_cats = set(val_fold["category_id"].unique())
+        train_cats = set(train_fold["category_id"].unique())
+        orphan = val_cats - train_cats
+
+        print(f"\n--- Fold {fold_idx + 1}/{n_splits} "
+              f"(train={len(train_fold)}, val={len(val_fold)}, "
+              f"orphan_cats={len(orphan)}) ---")
+
         model_bundle = fit_bundle(train_fold)
-        predictions = predict_with_bundle(model_bundle, valid_fold)
-        scores.append(score_predictions(valid_fold, predictions))
+        predictions = predict_with_bundle(model_bundle, val_fold)
+        fold_score = score_predictions(val_fold, predictions)
+        scores.append(fold_score)
+
+        print(f"  Score={fold_score['score']:.4f}  "
+              f"F1_dept={fold_score['department_f1']:.4f}  "
+              f"Acc_cat={fold_score['category_accuracy']:.4f}  ")
 
     metrics = {
-        "score_mean": float(np.mean([item["score"] for item in scores])),
-        "score_std": float(np.std([item["score"] for item in scores])),
-        "department_f1_mean": float(
-            np.mean([item["department_f1"] for item in scores])
-        ),
-        "category_accuracy_mean": float(
-            np.mean([item["category_accuracy"] for item in scores])
-        ),
+        "score_mean": float(np.mean([s["score"] for s in scores])),
+        "score_std": float(np.std([s["score"] for s in scores])),
+        "department_f1_mean": float(np.mean([s["department_f1"] for s in scores])),
+        "category_accuracy_mean": float(np.mean([s["category_accuracy"] for s in scores])),
     }
+
+    print(f"\n  >>> MEAN Score: {metrics['score_mean']:.4f} "
+          f"± {metrics['score_std']:.4f}")
+    print(f"  >>> MEAN F1_dept:  {metrics['department_f1_mean']:.4f}")
+    print(f"  >>> MEAN Acc_cat:  {metrics['category_accuracy_mean']:.4f}")
     return metrics
 
 
