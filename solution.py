@@ -9,12 +9,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import ShuffleSplit
-from sklearn.linear_model import SGDClassifier
-from sklearn.linear_model import PassiveAggressiveClassifier
 from sklearn.svm import LinearSVC
 
 TEXT_COLUMNS = [
@@ -25,22 +22,12 @@ TEXT_COLUMNS = [
     "shop_category_name",
 ]
 OVERRIDE_RULES = [
-    ("shop_category_name", "title"),
     ("vendor_name", "title"),
-    ("shop_category_name", "vendor_code"),
     ("shop_category_name",),
+    ("shop_category_name", "title"),
     ("title",),
     ("vendor_code",),
 ]
-OVERRIDE_MAJORITY_RULES = {
-    ("shop_category_name",),
-}
-OVERRIDE_MAJORITY_MIN_COUNT = 5
-OVERRIDE_MAJORITY_MIN_SHARE = 0.98
-USE_NORMALIZED_UNIQUE_OVERRIDES = False
-_VC_NORM_RE = re.compile(r"[^0-9a-zа-я]+", re.IGNORECASE)
-_TITLE_PUNCT_RE = re.compile(r"[^0-9a-zа-я]+", re.IGNORECASE)
-_TITLE_NUM_RE = re.compile(r"\d+")
 WORD_VECTORIZER_PARAMS = {
     "analyzer": "word",
     "ngram_range": (1, 2),
@@ -74,107 +61,16 @@ DEPARTMENT_MODEL_PARAMS = {
     "C": 0.4,
     "random_state": 42,
 }
-DEPARTMENT_MODEL_TYPE = "linearsvc"  # "linearsvc" | "sgd" | "pa"
-DEPARTMENT_SGD_PARAMS = {
-    "loss": "hinge",
-    "alpha": 1e-5,
-    "penalty": "l2",
-    "class_weight": "balanced",
-    "max_iter": 2000,
-    "tol": 1e-3,
-    "random_state": 42,
-}
-DEPARTMENT_PA_PARAMS = {
-    "C": 0.5,
-    "loss": "hinge",
-    "class_weight": "balanced",
-    "max_iter": 1000,
-    "tol": 1e-3,
-    "random_state": 42,
-}
 BATCH_SIZE = 256
-MAIN_CHAR_BLOCK_WEIGHT = 1.0
-TITLE_CHAR_BLOCK_WEIGHT = 1.0
-VENDOR_REPEATS = 1
+VENDOR_REPEATS = 2
 CODE_REPEATS = 1
-TITLE_REPEATS = 5
-SHOP_CATEGORY_REPEATS = 5
+TITLE_REPEATS = 6
+SHOP_CATEGORY_REPEATS = 6
 DESCRIPTION_REPEATS = 1
-TITLE_VIEW_INCLUDE_SHOP_CATEGORY = False
-TITLE_VIEW_INCLUDE_VENDOR_NAME = False
-TITLE_VIEW_SHOP_CATEGORY_REPEATS = 2
-TITLE_VIEW_VENDOR_NAME_REPEATS = 1
-TITLE_USE_BM25 = False
-BM25_K1 = 1.6
-BM25_B = 0.75
 UNCERTAIN_MARGIN_THRESHOLD = 0.25
 UNCERTAIN_TOP_DEPARTMENTS = 3
 TITLE_BONUS_WEIGHT = 0.2
 DEPARTMENT_SYNC_SCORE_GAP_THRESHOLD = 0.5
-DEPARTMENT_SCORE_BONUS_WEIGHT_FOR_CATEGORY = 0.0
-CATEGORY_CENTROID_DEPT_SHRINK_ALPHA = 0.0
-
-
-class BM25Vectorizer:
-    def __init__(
-        self,
-        *,
-        k1: float = BM25_K1,
-        b: float = BM25_B,
-        dtype=np.float32,
-        **count_vectorizer_params,
-    ) -> None:
-        self.k1 = float(k1)
-        self.b = float(b)
-        self.dtype = dtype
-        self._cv = CountVectorizer(**count_vectorizer_params)
-        self._idf: np.ndarray | None = None
-        self._avgdl: float | None = None
-
-    def fit_transform(self, raw_documents: list[str]) -> sparse.csr_matrix:
-        counts = self._cv.fit_transform(raw_documents).tocsr()
-        self._init_idf_and_avgdl(counts)
-        return self._bm25_transform_from_counts(counts)
-
-    def transform(self, raw_documents: list[str]) -> sparse.csr_matrix:
-        if self._idf is None or self._avgdl is None:
-            raise RuntimeError("BM25Vectorizer is not fitted")
-        counts = self._cv.transform(raw_documents).tocsr()
-        return self._bm25_transform_from_counts(counts)
-
-    def _init_idf_and_avgdl(self, counts: sparse.csr_matrix) -> None:
-        n_docs = counts.shape[0]
-        df = np.diff(counts.tocsc().indptr).astype(np.float64, copy=False)
-        idf = np.log((n_docs - df + 0.5) / (df + 0.5) + 1.0)
-        self._idf = idf.astype(self.dtype, copy=False)
-        doc_len = np.asarray(counts.sum(axis=1)).ravel().astype(np.float64, copy=False)
-        self._avgdl = float(doc_len.mean()) if n_docs else 0.0
-
-    def _bm25_transform_from_counts(self, counts: sparse.csr_matrix) -> sparse.csr_matrix:
-        if self._idf is None or self._avgdl is None:
-            raise RuntimeError("BM25Vectorizer is not fitted")
-        counts = counts.astype(np.float32, copy=True)
-        doc_len = np.asarray(counts.sum(axis=1)).ravel().astype(np.float32, copy=False)
-        avgdl = float(self._avgdl) if self._avgdl else 1.0
-        k1 = float(self.k1)
-        b = float(self.b)
-
-        # Per-document normalizer: k1 * (1 - b + b * dl/avgdl)
-        norm = k1 * (1.0 - b + b * (doc_len / avgdl))
-        indptr = counts.indptr
-        indices = counts.indices
-        data = counts.data
-        idf = self._idf
-
-        for row in range(counts.shape[0]):
-            start, end = int(indptr[row]), int(indptr[row + 1])
-            if start == end:
-                continue
-            tf = data[start:end]
-            cols = indices[start:end]
-            denom = tf + norm[row]
-            data[start:end] = idf[cols] * (tf * (k1 + 1.0) / denom)
-        return counts.tocsr()
 
 
 def clean_text(value: object) -> str:
@@ -185,21 +81,6 @@ def clean_text(value: object) -> str:
     text = text.replace("\\n", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip().lower()
-
-
-def clean_vendor_code(value: object) -> str:
-    text = clean_text(value)
-    return _VC_NORM_RE.sub("", text)
-
-
-def canonicalize_title(value: object) -> str:
-    text = clean_text(value)
-    if not text:
-        return ""
-    text = _TITLE_PUNCT_RE.sub(" ", text)
-    text = _TITLE_NUM_RE.sub("#", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 def load_dataset(path: str | Path) -> pd.DataFrame:
@@ -237,26 +118,7 @@ def build_search_texts(dataframe: pd.DataFrame) -> list[str]:
 
 
 def build_title_texts(dataframe: pd.DataFrame) -> list[str]:
-    if not TITLE_VIEW_INCLUDE_SHOP_CATEGORY and not TITLE_VIEW_INCLUDE_VENDOR_NAME:
-        return dataframe["title"].map(clean_text).tolist()
-
-    texts: list[str] = []
-    rows = dataframe[["title", "shop_category_name", "vendor_name"]].itertuples(
-        index=False, name=None
-    )
-    for title, shop_category_name, vendor_name in rows:
-        c_title = clean_text(title)
-        c_shopcat = clean_text(shop_category_name)
-        c_vendor = clean_text(vendor_name)
-        parts = ["title " + c_title]
-        if TITLE_VIEW_INCLUDE_SHOP_CATEGORY:
-            for _ in range(TITLE_VIEW_SHOP_CATEGORY_REPEATS):
-                parts.append("shopcat " + c_shopcat)
-        if TITLE_VIEW_INCLUDE_VENDOR_NAME:
-            for _ in range(TITLE_VIEW_VENDOR_NAME_REPEATS):
-                parts.append("vendor " + c_vendor)
-        texts.append(" ".join(parts))
-    return texts
+    return dataframe["title"].map(clean_text).tolist()
 
 
 def build_rule_keys(dataframe: pd.DataFrame, columns: tuple[str, ...]) -> np.ndarray:
@@ -285,49 +147,6 @@ def build_unique_category_map(
     return dict(zip(unique_rows["key"], unique_rows["category_id"]))
 
 
-def build_normalized_unique_category_map(
-    dataframe: pd.DataFrame,
-    column: str,
-    normalizer,
-) -> dict[str, int]:
-    temp = dataframe[[column, "category_id"]].copy()
-    temp["key"] = temp[column].map(normalizer)
-    temp = temp[temp["key"].map(has_meaningful_key)]
-    counts = temp.groupby("key")["category_id"].nunique()
-    unique_keys = counts[counts == 1].index
-    if len(unique_keys) == 0:
-        return {}
-    unique_rows = temp[temp["key"].isin(unique_keys)].drop_duplicates("key")
-    return dict(zip(unique_rows["key"], unique_rows["category_id"]))
-
-
-def build_majority_category_map(
-    dataframe: pd.DataFrame,
-    columns: tuple[str, ...],
-    *,
-    min_count: int | None = None,
-    min_share: float | None = None,
-) -> dict[str, int]:
-    if min_count is None:
-        min_count = int(OVERRIDE_MAJORITY_MIN_COUNT)
-    if min_share is None:
-        min_share = float(OVERRIDE_MAJORITY_MIN_SHARE)
-    temp = dataframe[list(columns) + ["category_id"]].copy()
-    temp["key"] = build_rule_keys(temp, columns)
-    temp = temp[temp["key"].map(has_meaningful_key)]
-    if len(temp) == 0:
-        return {}
-
-    grouped = temp.groupby("key")["category_id"]
-    total = grouped.count()
-    mode = grouped.agg(lambda x: x.value_counts().index[0])
-    mode_count = grouped.agg(lambda x: x.value_counts().iloc[0])
-    share = mode_count / total
-    mask = (total >= int(min_count)) & (share >= float(min_share))
-    if not bool(mask.any()):
-        return {}
-    return dict(zip(mode[mask].index, mode[mask].astype(int).values))
-
 def fit_feature_blocks(
     texts: list[str],
 ) -> tuple[TfidfVectorizer, TfidfVectorizer, sparse.csr_matrix]:
@@ -335,8 +154,6 @@ def fit_feature_blocks(
     char_vectorizer = TfidfVectorizer(**CHAR_VECTORIZER_PARAMS)
     word_features = word_vectorizer.fit_transform(texts)
     char_features = char_vectorizer.fit_transform(texts)
-    if MAIN_CHAR_BLOCK_WEIGHT != 1.0:
-        char_features = char_features.multiply(np.float32(MAIN_CHAR_BLOCK_WEIGHT))
     features = sparse.hstack(
         [word_features, char_features],
         format="csr",
@@ -352,8 +169,6 @@ def transform_feature_blocks(
 ) -> sparse.csr_matrix:
     word_features = word_vectorizer.transform(texts)
     char_features = char_vectorizer.transform(texts)
-    if MAIN_CHAR_BLOCK_WEIGHT != 1.0:
-        char_features = char_features.multiply(np.float32(MAIN_CHAR_BLOCK_WEIGHT))
     return sparse.hstack(
         [word_features, char_features],
         format="csr",
@@ -363,31 +178,11 @@ def transform_feature_blocks(
 
 def fit_title_feature_blocks(
     texts: list[str],
-) -> tuple[object, object, sparse.csr_matrix]:
-    if TITLE_USE_BM25:
-        word_vectorizer = BM25Vectorizer(
-            k1=BM25_K1,
-            b=BM25_B,
-            analyzer=TITLE_WORD_VECTORIZER_PARAMS["analyzer"],
-            ngram_range=TITLE_WORD_VECTORIZER_PARAMS["ngram_range"],
-            max_features=TITLE_WORD_VECTORIZER_PARAMS["max_features"],
-            dtype=TITLE_WORD_VECTORIZER_PARAMS["dtype"],
-        )
-        char_vectorizer = BM25Vectorizer(
-            k1=BM25_K1,
-            b=BM25_B,
-            analyzer=TITLE_CHAR_VECTORIZER_PARAMS["analyzer"],
-            ngram_range=TITLE_CHAR_VECTORIZER_PARAMS["ngram_range"],
-            max_features=TITLE_CHAR_VECTORIZER_PARAMS["max_features"],
-            dtype=TITLE_CHAR_VECTORIZER_PARAMS["dtype"],
-        )
-    else:
-        word_vectorizer = TfidfVectorizer(**TITLE_WORD_VECTORIZER_PARAMS)
-        char_vectorizer = TfidfVectorizer(**TITLE_CHAR_VECTORIZER_PARAMS)
+) -> tuple[TfidfVectorizer, TfidfVectorizer, sparse.csr_matrix]:
+    word_vectorizer = TfidfVectorizer(**TITLE_WORD_VECTORIZER_PARAMS)
+    char_vectorizer = TfidfVectorizer(**TITLE_CHAR_VECTORIZER_PARAMS)
     word_features = word_vectorizer.fit_transform(texts)
     char_features = char_vectorizer.fit_transform(texts)
-    if TITLE_CHAR_BLOCK_WEIGHT != 1.0:
-        char_features = char_features.multiply(np.float32(TITLE_CHAR_BLOCK_WEIGHT))
     features = sparse.hstack(
         [word_features, char_features],
         format="csr",
@@ -397,14 +192,12 @@ def fit_title_feature_blocks(
 
 
 def transform_title_feature_blocks(
-    word_vectorizer: object,
-    char_vectorizer: object,
+    word_vectorizer: TfidfVectorizer,
+    char_vectorizer: TfidfVectorizer,
     texts: list[str],
 ) -> sparse.csr_matrix:
     word_features = word_vectorizer.transform(texts)
     char_features = char_vectorizer.transform(texts)
-    if TITLE_CHAR_BLOCK_WEIGHT != 1.0:
-        char_features = char_features.multiply(np.float32(TITLE_CHAR_BLOCK_WEIGHT))
     return sparse.hstack(
         [word_features, char_features],
         format="csr",
@@ -454,32 +247,6 @@ def build_category_centroids(
     )
 
 
-def build_department_centroids(
-    train_matrix: sparse.csr_matrix,
-    train_departments: np.ndarray,
-) -> tuple[np.ndarray, sparse.csr_matrix, dict[int, int]]:
-    department_labels, inverse_indices = np.unique(
-        train_departments,
-        return_inverse=True,
-    )
-    row_indices = inverse_indices.astype(np.int32, copy=False)
-    col_indices = np.arange(train_matrix.shape[0], dtype=np.int32)
-    weights = np.ones(train_matrix.shape[0], dtype=np.float32)
-    assignment = sparse.csr_matrix(
-        (weights, (row_indices, col_indices)),
-        shape=(len(department_labels), train_matrix.shape[0]),
-        dtype=np.float32,
-    )
-    counts = np.asarray(assignment.sum(axis=1)).ravel()
-    normalizer = sparse.diags(
-        1.0 / np.maximum(counts, 1.0),
-        dtype=np.float32,
-    )
-    centroid_matrix = (normalizer @ assignment @ train_matrix).tocsr()
-    label_to_row = {int(label): int(i) for i, label in enumerate(department_labels)}
-    return department_labels.astype(np.int64, copy=False), centroid_matrix, label_to_row
-
-
 def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     texts = build_search_texts(dataframe)
     title_texts = build_title_texts(dataframe)
@@ -488,14 +255,7 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
         title_texts
     )
 
-    if DEPARTMENT_MODEL_TYPE == "linearsvc":
-        department_model = LinearSVC(**DEPARTMENT_MODEL_PARAMS)
-    elif DEPARTMENT_MODEL_TYPE == "sgd":
-        department_model = SGDClassifier(**DEPARTMENT_SGD_PARAMS)
-    elif DEPARTMENT_MODEL_TYPE == "pa":
-        department_model = PassiveAggressiveClassifier(**DEPARTMENT_PA_PARAMS)
-    else:
-        raise ValueError(f"Unknown DEPARTMENT_MODEL_TYPE={DEPARTMENT_MODEL_TYPE!r}")
+    department_model = LinearSVC(**DEPARTMENT_MODEL_PARAMS)
     department_model.fit(train_matrix, dataframe["department_id"])
 
     train_categories = dataframe["category_id"].to_numpy(dtype=np.int32)
@@ -528,58 +288,14 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
     if not np.array_equal(category_labels, title_category_labels):
         raise ValueError("Category labels are inconsistent across feature views")
 
-    if CATEGORY_CENTROID_DEPT_SHRINK_ALPHA:
-        alpha = float(CATEGORY_CENTROID_DEPT_SHRINK_ALPHA)
-        if not (0.0 < alpha < 1.0):
-            raise ValueError("CATEGORY_CENTROID_DEPT_SHRINK_ALPHA must be in (0, 1)")
-        dept_labels, dept_centroids, dept_to_row = build_department_centroids(
-            train_matrix,
-            dataframe["department_id"].to_numpy(dtype=np.int64, copy=False),
-        )
-        dept_rows = np.array(
-            [dept_to_row[int(dept)] for dept in category_departments],
-            dtype=np.int32,
-        )
-        dept_centroids_for_cat = dept_centroids[dept_rows]
-        category_centroid_matrix = category_centroid_matrix.multiply(
-            np.float32(1.0 - alpha)
-        ) + dept_centroids_for_cat.multiply(np.float32(alpha))
-
-        _, title_dept_centroids, _ = build_department_centroids(
-            title_matrix,
-            dataframe["department_id"].to_numpy(dtype=np.int64, copy=False),
-        )
-        title_dept_centroids_for_cat = title_dept_centroids[dept_rows]
-        category_title_centroid_matrix = category_title_centroid_matrix.multiply(
-            np.float32(1.0 - alpha)
-        ) + title_dept_centroids_for_cat.multiply(np.float32(alpha))
-
     override_maps = []
     for columns in OVERRIDE_RULES:
-        mapping = build_unique_category_map(dataframe, columns)
-        if columns in OVERRIDE_MAJORITY_RULES:
-            majority = build_majority_category_map(dataframe, columns)
-            if majority:
-                majority.update(mapping)
-                mapping = majority
-        override_maps.append({"columns": columns, "mapping": mapping})
-
-    normalized_override_maps: list[dict[str, object]] = []
-    if USE_NORMALIZED_UNIQUE_OVERRIDES:
-        vc_map = build_normalized_unique_category_map(
-            dataframe, "vendor_code", clean_vendor_code
+        override_maps.append(
+            {
+                "columns": columns,
+                "mapping": build_unique_category_map(dataframe, columns),
+            }
         )
-        if vc_map:
-            normalized_override_maps.append(
-                {"column": "vendor_code", "mapping": vc_map, "normalizer": "vendor_code"}
-            )
-        title_map = build_normalized_unique_category_map(
-            dataframe, "title", canonicalize_title
-        )
-        if title_map:
-            normalized_override_maps.append(
-                {"column": "title", "mapping": title_map, "normalizer": "title"}
-            )
 
     return {
         "word_vectorizer": word_vectorizer,
@@ -594,7 +310,6 @@ def fit_bundle(dataframe: pd.DataFrame) -> dict[str, object]:
         "department_category_indices": department_category_indices,
         "category_department_map": category_department_map,
         "override_maps": override_maps,
-        "normalized_override_maps": normalized_override_maps,
     }
 
 
@@ -616,7 +331,6 @@ def nearest_centroid_category_indices(
     category_title_centroid_matrix: sparse.csr_matrix,
     department_category_indices: dict[int, np.ndarray],
     top_departments: np.ndarray,
-    top_department_scores: np.ndarray,
     uncertain_mask: np.ndarray,
     batch_size: int = BATCH_SIZE,
 ) -> np.ndarray:
@@ -653,34 +367,29 @@ def nearest_centroid_category_indices(
             predictions[batch_query_indices] = candidate_indices[best_local_indices]
 
     for query_index in np.flatnonzero(uncertain_mask):
-        best_adjusted_score = -np.inf
-        best_category_index = -1
-        for dept_pos, department in enumerate(top_departments[query_index]):
-            candidate_indices = department_category_indices.get(
-                int(department),
-                all_indices,
+        candidate_parts = []
+        for department in top_departments[query_index]:
+            candidate_parts.append(
+                department_category_indices.get(
+                    int(department),
+                    np.empty(0, dtype=np.int32),
+                )
             )
-            if len(candidate_indices) == 0:
-                candidate_indices = all_indices
-            candidate_matrix = category_centroid_matrix[candidate_indices]
-            candidate_title_matrix = category_title_centroid_matrix[candidate_indices]
-            scores = compute_similarity_scores(
-                query_matrix[query_index : query_index + 1],
-                candidate_matrix,
-                query_title_matrix[query_index : query_index + 1],
-                candidate_title_matrix,
-            )
-            best_local_index = int(np.asarray(scores.argmax(axis=1)).ravel()[0])
-            best_score = float(np.asarray(scores.max()).ravel()[0])
-            dept_score = float(top_department_scores[query_index, dept_pos])
-            adjusted = best_score + DEPARTMENT_SCORE_BONUS_WEIGHT_FOR_CATEGORY * dept_score
-            if adjusted > best_adjusted_score:
-                best_adjusted_score = adjusted
-                best_category_index = int(candidate_indices[best_local_index])
-
-        if best_category_index < 0:
-            best_category_index = int(all_indices[0])
-        predictions[query_index] = best_category_index
+        candidate_indices = (
+            np.concatenate(candidate_parts) if candidate_parts else all_indices
+        )
+        if len(candidate_indices) == 0:
+            candidate_indices = all_indices
+        candidate_matrix = category_centroid_matrix[candidate_indices]
+        candidate_title_matrix = category_title_centroid_matrix[candidate_indices]
+        scores = compute_similarity_scores(
+            query_matrix[query_index : query_index + 1],
+            candidate_matrix,
+            query_title_matrix[query_index : query_index + 1],
+            candidate_title_matrix,
+        )
+        best_local_index = int(np.asarray(scores.argmax(axis=1)).ravel()[0])
+        predictions[query_index] = candidate_indices[best_local_index]
     return predictions
 
 
@@ -749,48 +458,6 @@ def apply_category_overrides_with_flags(
     return predictions, override_used
 
 
-def apply_normalized_unique_overrides(
-    dataframe: pd.DataFrame,
-    predictions: np.ndarray,
-    override_used: np.ndarray,
-    normalized_override_maps: list[dict[str, object]],
-) -> tuple[np.ndarray, np.ndarray]:
-    if not normalized_override_maps:
-        return predictions, override_used
-    if len(predictions) == 0:
-        return predictions, override_used
-
-    remaining = np.flatnonzero(~override_used)
-    if len(remaining) == 0:
-        return predictions, override_used
-
-    for rule in normalized_override_maps:
-        column = str(rule.get("column", ""))
-        normalizer = str(rule.get("normalizer", ""))
-        mapping: dict[str, int] = rule.get("mapping", {})
-        if not column or not mapping:
-            continue
-
-        if normalizer == "vendor_code":
-            keys = dataframe[column].map(clean_vendor_code).to_numpy(dtype=object)
-        elif normalizer == "title":
-            keys = dataframe[column].map(canonicalize_title).to_numpy(dtype=object)
-        else:
-            continue
-
-        for row_index in remaining:
-            key = keys[row_index]
-            if has_meaningful_key(key) and key in mapping:
-                predictions[row_index] = mapping[key]
-                override_used[row_index] = True
-
-        remaining = np.flatnonzero(~override_used)
-        if len(remaining) == 0:
-            break
-
-    return predictions, override_used
-
-
 def apply_category_overrides(
     dataframe: pd.DataFrame,
     base_categories: np.ndarray,
@@ -805,35 +472,25 @@ def apply_category_overrides(
 
 
 def get_department_candidates(
-    department_model: object,
+    department_model: LinearSVC,
     query_matrix: sparse.csr_matrix,
     top_k: int = UNCERTAIN_TOP_DEPARTMENTS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     decision_scores = department_model.decision_function(query_matrix)
     if decision_scores.ndim == 1:
-        # LinearSVC returns signed distance for binary classification.
-        # Positive side corresponds to classes_[1], negative to classes_[0].
-        scores_2d = np.vstack([-decision_scores, decision_scores]).T
-        decision_scores = scores_2d
+        top_departments = department_model.predict(query_matrix).astype(np.int64).reshape(-1, 1)
+        uncertain_mask = np.zeros(query_matrix.shape[0], dtype=bool)
+        return top_departments, uncertain_mask
 
-    n_samples, n_classes = decision_scores.shape
-    top_k = max(1, min(int(top_k), int(n_classes)))
-    if top_k == 1:
-        top_indices = np.argmax(decision_scores, axis=1)[:, None]
-        top_scores = decision_scores[np.arange(n_samples), top_indices[:, 0]][:, None]
-    else:
-        top_indices = np.argpartition(-decision_scores, kth=top_k - 1, axis=1)[:, :top_k]
-        top_scores = decision_scores[np.arange(n_samples)[:, None], top_indices]
-        order = np.argsort(-top_scores, axis=1)
-        top_indices = top_indices[np.arange(n_samples)[:, None], order]
-        top_scores = top_scores[np.arange(n_samples)[:, None], order]
-
+    top_k = max(1, min(top_k, decision_scores.shape[1]))
+    sorted_indices = np.argsort(decision_scores, axis=1)
+    top_indices = sorted_indices[:, -top_k:][:, ::-1]
     top_departments = np.asarray(department_model.classes_[top_indices], dtype=np.int64)
-    if top_k >= 2:
-        uncertain_mask = (top_scores[:, 0] - top_scores[:, 1]) < UNCERTAIN_MARGIN_THRESHOLD
-    else:
-        uncertain_mask = np.zeros(n_samples, dtype=bool)
-    return top_departments, top_scores.astype(np.float32, copy=False), uncertain_mask
+
+    top_scores = decision_scores[np.arange(decision_scores.shape[0]), top_indices[:, 0]]
+    second_scores = decision_scores[np.arange(decision_scores.shape[0]), top_indices[:, 1]]
+    uncertain_mask = (top_scores - second_scores) < UNCERTAIN_MARGIN_THRESHOLD
+    return top_departments, uncertain_mask
 
 
 def predict_with_bundle(
@@ -852,7 +509,7 @@ def predict_with_bundle(
         title_texts,
     )
 
-    top_departments, top_department_scores, uncertain_mask = get_department_candidates(
+    top_departments, uncertain_mask = get_department_candidates(
         model_bundle["department_model"],
         query_matrix,
     )
@@ -864,7 +521,6 @@ def predict_with_bundle(
         model_bundle["category_title_centroid_matrix"],
         model_bundle["department_category_indices"],
         top_departments,
-        top_department_scores,
         uncertain_mask,
     )
     base_categories = model_bundle["category_labels"][base_category_indices]
@@ -872,12 +528,6 @@ def predict_with_bundle(
         dataframe,
         base_categories,
         model_bundle["override_maps"],
-    )
-    category_predictions, override_used = apply_normalized_unique_overrides(
-        dataframe,
-        category_predictions,
-        override_used,
-        model_bundle.get("normalized_override_maps", []),
     )
     final_departments = department_predictions.astype(np.int64, copy=True)
     base_category_departments = model_bundle["category_departments"][
